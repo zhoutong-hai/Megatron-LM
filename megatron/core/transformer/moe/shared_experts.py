@@ -87,7 +87,9 @@ class SharedExpertMLP(MLP):
                     TELinear, set_save_original_input = None, None
 
                 if HAVE_TE and isinstance(self.linear_fc1, TELinear):
-                    set_save_original_input(self.linear_fc1)
+                    # TE DelayedScaling doesn't support save_original_input
+                    if not (getattr(self.config, "fp8", False) and getattr(self.config, "fp8_recipe", None) == "delayed"):
+                        set_save_original_input(self.linear_fc1)
 
         if self.config.moe_shared_expert_overlap:
             # disable TP related AG/RS communications in the linear module

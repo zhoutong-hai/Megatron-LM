@@ -385,4 +385,6 @@ class MoELayer(BaseMoELayer):
         if self.shared_experts is not None and not self.shared_experts_recompute:
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
-            set_save_original_input(self.shared_experts.linear_fc1)
+            # TE DelayedScaling doesn't support save_original_input
+            if not (getattr(self.config, "fp8", False) and getattr(self.config, "fp8_recipe", None) == "delayed"):
+                set_save_original_input(self.shared_experts.linear_fc1)
