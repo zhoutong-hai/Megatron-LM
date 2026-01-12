@@ -812,7 +812,9 @@ class TEGroupedMLP(MegatronModule):
         if self.activation_recompute and self.config.fp8:
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
-            set_save_original_input(self.linear_fc2)
+            # TE DelayedScaling recipe is not supported with save_original_input
+            if not (getattr(self.config, "fp8", False) and getattr(self.config, "fp8_recipe", None) == "delayed"):
+                set_save_original_input(self.linear_fc2)
 
         if self.config.fp8:
             assert HAVE_TE, "FP8 requires TE."
