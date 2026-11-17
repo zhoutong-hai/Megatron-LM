@@ -1,12 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import SGD, Adam
+from torch.optim import SGD, Adam, AdamW
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as GPUAdam
@@ -17,6 +18,8 @@ except:
     from torch.optim import Adam as GPUAdam
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.transformer.module import (
     convert_module_to_dtype_except_fp32_marked,
     mark_keep_in_fp32,
@@ -313,3 +316,98 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         assert torch.allclose(
             v, ref_params[k], atol=1e-03
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+
+
+@pytest.mark.skipif(
+    "transformer_engine" not in GPUAdam.__module__, reason="Requires TE FusedAdam group counters"
+)
+@pytest.mark.parametrize("offload_fraction", [0.8, 1.0])
+@pytest.mark.parametrize("low_memory_resume", [False, True])
+def test_distributed_hdo_resume_preserves_counters_and_placement(
+    offload_fraction, low_memory_resume
+):
+    """Restore allocated DCP state, then match two uninterrupted mixed-precision updates."""
+
+    def make_optimizer():
+        params = [
+            nn.Parameter(
+                torch.full(
+                    (32,),
+                    0.125 + index / 32,
+                    device="cuda",
+                    dtype=torch.float32 if index == 0 else torch.bfloat16,
+                )
+            )
+            for index in range(10)
+        ]
+        group = {
+            "params": params,
+            **{key: False if key.startswith("is_") else 1.0 for key in param_group_identifier_keys},
+        }
+        optimizer = HybridDeviceOptimizer(
+            [group],
+            offload_fraction=offload_fraction,
+            cpu_optimizer_cls=AdamW,
+            gpu_optimizer_cls=GPUAdam,
+            param_update_in_fp32=True,
+            overlap_cpu_optimizer_d2h_h2d=True,
+            lr=1e-2,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=0.1,
+            bias_correction=True,
+            fused=True,
+        )
+        return params, optimizer
+
+    def advance(params, optimizer, step):
+        for index, param in enumerate(params):
+            param.grad = torch.full_like(param, 0.01 * step * (index + 1))
+        optimizer.step()
+        optimizer.zero_grad()
+
+    def assert_equal_state(actual, expected):
+        actual_state = actual.state_dict()
+        expected_state = expected.state_dict()
+        assert actual_state["param_groups"] == expected_state["param_groups"]
+        assert actual_state["state"].keys() == expected_state["state"].keys()
+        for param_id, state in actual_state["state"].items():
+            reference = expected_state["state"][param_id]
+            assert state.keys() == reference.keys()
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    assert value.dtype == reference[key].dtype
+                    assert value.device == reference[key].device
+                    torch.testing.assert_close(value, reference[key], rtol=0, atol=0)
+                else:
+                    assert value == reference[key]
+
+    params, optimizer = make_optimizer()
+    ref_params, reference = make_optimizer()
+    for step in (1, 2):
+        advance(params, optimizer, step)
+        advance(ref_params, reference, step)
+    distributed = DistributedOptimizer.__new__(DistributedOptimizer)
+    distributed.optimizer = optimizer
+    distributed.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
+    distributed.config = SimpleNamespace(low_memory_resume=low_memory_resume, fp16=False)
+    distributed.grad_scaler = None
+    distributed._optimizer_state_offloader = None
+    # DCP has filled the allocated tensors in place. Exercise the real metadata
+    # load and final placement path without needing a model or checkpoint files.
+    checkpoint = distributed.state_dict()
+    checkpoint.update(param_state={}, param_state_sharding_type="fully_sharded_model_space")
+    distributed.load_parameter_state_from_fs_model_space = lambda _: None
+    distributed.load_state_dict(checkpoint)
+    assert_equal_state(optimizer, reference)
+
+    for step in (3, 4):
+        advance(params, optimizer, step)
+        advance(ref_params, reference, step)
+        assert_equal_state(optimizer, reference)
+        for actual, expected in zip(params, ref_params):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for sub_optimizer in optimizer.cpu_optimizers:
+            assert all(state["step"].item() == step for state in sub_optimizer.state.values())
+        if optimizer.gpu_optimizer is not None:
+            assert all(group["step"] == step for group in optimizer.gpu_optimizer.param_groups)

@@ -1048,8 +1048,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             if low_mem_resume and USING_TE_OPTIMIZER and not is_patch_applied():
                                 apply_fused_adam_patch()
                             init_device = 'cpu' if low_mem_resume else torch.cuda.current_device()
-                            init_shard = lambda dtype=torch.float32, _device=init_device: torch.empty(
-                                (numel,), dtype=dtype, device=_device
+                            init_shard = (
+                                lambda dtype=torch.float32, _device=init_device: torch.empty(
+                                    (numel,), dtype=dtype, device=_device
+                                )
                             )
 
                             # For precision_aware_optimizer, the empty tensors should also be
@@ -1108,6 +1110,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 optimizer_state_dict
             )
 
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # The checkpoint's aggregate step has now reached each sub-optimizer.
+            # Keeping it on HDO groups would overwrite FusedAdam's advancing group
+            # counter on every step. Fused optimizers also do not own the per-param
+            # step tensors that were needed to restore the CPU Adam optimizers.
+            for group in self.optimizer.param_groups:
+                group.pop("step", None)
+            for sub_optimizer in self.optimizer.sub_optimizers:
+                if not isinstance(sub_optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                    for param_state in sub_optimizer.state.values():
+                        param_state.pop("step", None)
+
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
@@ -1148,7 +1162,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
 
-            if self.config.low_memory_resume:
+            # HDO has already restored each state's CPU/GPU placement. Moving all
+            # CPU tensors to CUDA here would defeat its configured offload fraction.
+            if self.config.low_memory_resume and not isinstance(
+                self.optimizer, HybridDeviceOptimizer
+            ):
                 for state in self.optimizer.state.values():
                     for k, v in state.items():
                         if isinstance(v, torch.Tensor) and v.device.type == 'cpu':
