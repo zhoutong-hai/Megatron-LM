@@ -369,12 +369,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def _update_fp32_params_by_new_state(self):
         if not self.param_update_in_fp32:
             return
-        for param, v in self.state.items():
-            # Native FP32 params do not need a separate master parameter and are
-            # intentionally absent from param_to_fp32_param.
-            fp32_param = self.param_to_fp32_param.get(param)
-            if fp32_param is not None:
-                fp32_param.data.copy_(v["master_param"])
+        for param, state in self.state.items():
+            # Native FP32 parameters can also have an offloaded CPU master.
+            # Restore the parameter actually used by the sub-optimizer and keep
+            # the reported master tied to it, rather than retaining a stale copy.
+            master_param = self.param_to_inner_param[param]
+            master_param.data.copy_(state["master_param"])
+            state["master_param"] = master_param
 
     def update_fp32_param_by_new_param(self):
         """

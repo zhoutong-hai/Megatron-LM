@@ -2205,6 +2205,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ):
                         # Main param & optimizer states.
                         self._set_main_param_and_optimizer_states(model_param, src_tensors)
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     @torch.no_grad()
     def load_parameter_state_from_fs_model_space(self, state_dict):

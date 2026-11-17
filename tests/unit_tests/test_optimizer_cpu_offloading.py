@@ -370,6 +370,18 @@ def test_distributed_hdo_resume_preserves_counters_and_placement(
         actual_state = actual.state_dict()
         expected_state = expected.state_dict()
         assert actual_state["param_groups"] == expected_state["param_groups"]
+        # Compare the FP32 parameters actually used by each sub-optimizer, not
+        # only HDO's reported state, which can otherwise contain newer tensors.
+        for actual_group, expected_group in zip(actual.param_groups, expected.param_groups):
+            for actual_param, expected_param in zip(
+                actual_group["params"], expected_group["params"]
+            ):
+                torch.testing.assert_close(
+                    actual.param_to_inner_param[actual_param],
+                    expected.param_to_inner_param[expected_param],
+                    rtol=0,
+                    atol=0,
+                )
         assert actual_state["state"].keys() == expected_state["state"].keys()
         for param_id, state in actual_state["state"].items():
             reference = expected_state["state"][param_id]
@@ -384,20 +396,46 @@ def test_distributed_hdo_resume_preserves_counters_and_placement(
 
     params, optimizer = make_optimizer()
     ref_params, reference = make_optimizer()
+    # Allocate destination state as native DCP template creation does, then
+    # independently load the saved BF16/FP32 model parameters.
+    advance(params, optimizer, 1)
     for step in (1, 2):
-        advance(params, optimizer, step)
         advance(ref_params, reference, step)
+    with torch.no_grad():
+        for actual, expected in zip(params, ref_params):
+            actual.copy_(expected)
     distributed = DistributedOptimizer.__new__(DistributedOptimizer)
     distributed.optimizer = optimizer
     distributed.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
-    distributed.config = SimpleNamespace(low_memory_resume=low_memory_resume, fp16=False)
+    distributed.config = SimpleNamespace(
+        low_memory_resume=low_memory_resume,
+        fp16=False,
+        use_precision_aware_optimizer_no_fp8_or_ds_fp8=True,
+    )
     distributed.grad_scaler = None
     distributed._optimizer_state_offloader = None
-    # DCP has filled the allocated tensors in place. Exercise the real metadata
-    # load and final placement path without needing a model or checkpoint files.
-    checkpoint = distributed.state_dict()
-    checkpoint.update(param_state={}, param_state_sharding_type="fully_sharded_model_space")
-    distributed.load_parameter_state_from_fs_model_space = lambda _: None
+    distributed.model_param_group_index_map = {
+        param: (0, index) for index, param in enumerate(params)
+    }
+    distributed.gbuf_ranges = [{torch.bfloat16: [{"param_map": dict.fromkeys(params)}]}]
+    saved = DistributedOptimizer.__new__(DistributedOptimizer)
+    saved.optimizer = reference
+    saved.grad_scaler = None
+    checkpoint = saved.state_dict()
+    # Exercise the real bucket-space loader with independently loaded tensors.
+    # HDO must install these moments and FP32 masters in the live CPU/GPU optimizers.
+    bucket = [
+        {
+            "padding": False,
+            "param": reference.state[param]["master_param"].detach().cpu().clone(),
+            "exp_avg": reference.state[param]["exp_avg"].detach().cpu().clone(),
+            "exp_avg_sq": reference.state[param]["exp_avg_sq"].detach().cpu().clone(),
+        }
+        for param in ref_params
+    ]
+    checkpoint.update(
+        param_state={0: {torch.bfloat16: {0: bucket}}}, param_state_sharding_type="dp_reshardable"
+    )
     distributed.load_state_dict(checkpoint)
     assert_equal_state(optimizer, reference)
 
